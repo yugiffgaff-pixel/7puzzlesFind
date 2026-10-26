@@ -261,52 +261,366 @@ var Tangram = globalThis.Tangram || (globalThis.Tangram = {});
     return Math.abs(s) / 2;
   }
 
-  function alignAngle(points) {
+  function periodResidual(ang) {
+    const period = Math.PI / 4;
+    let m = ((ang % period) + period) % period;
+    if (m > period / 2) m = period - m;
+    return m;
+  }
+
+  function angleEnergy(points, theta) {
+    let err = 0;
+    let lenSum = 0;
+    for (let i = 0; i < points.length; i++) {
+      const a = points[i];
+      const b = points[(i + 1) % points.length];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      const m = periodResidual(Math.atan2(b[1] - a[1], b[0] - a[0]) - theta);
+      err += len * m * m;
+      lenSum += len;
+    }
+    return { err: err, len: lenSum };
+  }
+
+  // Smallest rotation that puts edges on the horizontal / vertical / 45° family.
+  // Searching a full 45° would spin an already upright figure onto its diagonal.
+  function alignmentOptions(points) {
+    const step = Math.PI / 180 / 2;
+    const limit = Math.PI / 8;
     let bestT = 0;
     let bestE = Infinity;
-    const step = Math.PI / 180 / 2;
-    for (let t = 0; t < Math.PI / 4; t += step) {
-      let err = 0;
-      for (let i = 0; i < points.length; i++) {
-        const a = points[i];
-        const b = points[(i + 1) % points.length];
-        const ang = Math.atan2(b[1] - a[1], b[0] - a[0]) - t;
-        const period = Math.PI / 4;
-        let m = ((ang % period) + period) % period;
-        if (m > period / 2) m = period - m;
-        const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
-        err += len * m * m;
-      }
-      if (err < bestE) {
-        bestE = err;
+    let perim = 1;
+    const samples = [];
+    for (let t = -limit; t <= limit + 1e-9; t += step) {
+      const scored = angleEnergy(points, t);
+      perim = scored.len;
+      samples.push([t, scored.err]);
+      if (scored.err < bestE) {
+        bestE = scored.err;
         bestT = t;
       }
     }
-    return bestT;
-  }
-
-  function bestFrac(values, unit) {
-    const fr = values.map(function (v) {
-      const t = v / unit;
-      return t - Math.floor(t);
-    });
-    let bestF = 0;
-    let bestErr = Infinity;
-    const cands = fr.concat([0]);
-    for (let i = 0; i < cands.length; i++) {
-      const f = cands[i];
-      let err = 0;
-      for (let j = 0; j < fr.length; j++) {
-        let d = Math.abs(fr[j] - f);
-        if (d > 0.5) d = 1 - d;
-        err += d * d;
+    function refine(center) {
+      let tBest = center;
+      let eBest = angleEnergy(points, center).err;
+      const fine = Math.PI / 180 / 20;
+      for (let t = center - step; t <= center + step; t += fine) {
+        if (t < -limit - 1e-9 || t > limit + 1e-9) continue;
+        const e = angleEnergy(points, t).err;
+        if (e < eBest) {
+          eBest = e;
+          tBest = t;
+        }
       }
-      if (err < bestErr) {
-        bestErr = err;
-        bestF = f;
+      return tBest;
+    }
+    bestT = refine(bestT);
+    const options = [bestT];
+    let secondT = null;
+    let secondE = Infinity;
+    for (let i = 0; i < samples.length; i++) {
+      const t = samples[i][0];
+      const e = samples[i][1];
+      if (Math.abs(t - bestT) < Math.PI / 18) continue;
+      if (e < secondE) {
+        secondE = e;
+        secondT = t;
       }
     }
-    return bestF;
+    if (secondT !== null && Math.sqrt(secondE / perim) < 0.05) {
+      options.push(refine(secondT));
+    }
+    return options;
+  }
+
+  function contourBulge(contour, simplified) {
+    const idx = indicesOf(contour, simplified);
+    if (!idx) return { max: Infinity, mean: Infinity };
+    let maxB = 0;
+    let wsum = 0;
+    let w = 0;
+    for (let i = 0; i < idx.length; i++) {
+      const nxt = (i + 1) % idx.length;
+      const pts = chainBetween(contour, idx[i], idx[nxt]);
+      const a = simplified[i];
+      const b = simplified[nxt];
+      let edgeMax = 0;
+      for (let k = 0; k < pts.length; k++) {
+        const d = pointLineDist(pts[k], a, b);
+        if (d > edgeMax) edgeMax = d;
+      }
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (edgeMax > maxB) maxB = edgeMax;
+      wsum += len * edgeMax;
+      w += len;
+    }
+    return { max: maxB, mean: w === 0 ? 0 : wsum / w };
+  }
+
+  // A small circle collapses to an octagon before the bow in each chord is obvious.
+  // Tangram edges come in lengths 1 and √2, so they are not all the same.
+  function roundLikeACircle(points, bulgeMean) {
+    if (points.length < 7 || bulgeMean < 0.6) return false;
+    let minL = Infinity;
+    let maxL = 0;
+    let n = 0;
+    for (let i = 0; i < points.length; i++) {
+      const a = points[i];
+      const b = points[(i + 1) % points.length];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (len < 2) continue;
+      n++;
+      if (len < minL) minL = len;
+      if (len > maxL) maxL = len;
+    }
+    return n >= 6 && minL > 0 && maxL / minL < 1.28;
+  }
+
+  function edgeAngleError(points) {
+    let wsum = 0;
+    let w = 0;
+    for (let i = 0; i < points.length; i++) {
+      const a = points[i];
+      const b = points[(i + 1) % points.length];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (len < 1e-6) continue;
+      wsum += len * periodResidual(Math.atan2(b[1] - a[1], b[0] - a[0]));
+      w += len;
+    }
+    return w === 0 ? Math.PI : wsum / w;
+  }
+
+  function rotateAround(points, cx, cy, co, si) {
+    const out = new Array(points.length);
+    for (let i = 0; i < points.length; i++) {
+      const x = points[i][0] - cx;
+      const y = points[i][1] - cy;
+      out[i] = [cx + x * co - y * si, cy + x * si + y * co];
+    }
+    return out;
+  }
+
+  // On the circle R/Z, center the tightest arc that covers every fractional part.
+  // Equal gaps (a coordinate and the same coordinate plus half a unit) both get returned,
+  // because rounding one of them can collapse a real edge.
+  function offsetCandidates(values, unit) {
+    const n = values.length;
+    const fr = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const t = values[i] / unit;
+      fr[i] = t - Math.floor(t);
+    }
+    fr.sort(function (a, b) {
+      return a - b;
+    });
+    const gaps = new Array(n);
+    for (let i = 0; i < n - 1; i++) gaps[i] = { gap: fr[i + 1] - fr[i], startAt: i + 1 };
+    gaps[n - 1] = { gap: fr[0] + 1 - fr[n - 1], startAt: 0 };
+    gaps.sort(function (a, b) {
+      return b.gap - a.gap;
+    });
+    const out = [];
+    for (let i = 0; i < gaps.length && i < 2; i++) {
+      if (i > 0 && gaps[0].gap - gaps[i].gap > 0.04) break;
+      const span = 1 - gaps[i].gap;
+      const start = fr[gaps[i].startAt];
+      const mid = start + span / 2;
+      const f = mid - Math.floor(mid);
+      let dup = false;
+      for (let k = 0; k < out.length; k++) {
+        const d = Math.abs(out[k].f - f);
+        if (Math.min(d, 1 - d) < 0.01) dup = true;
+      }
+      if (dup) continue;
+      let sum = 0;
+      let maxE = 0;
+      for (let j = 0; j < n; j++) {
+        const w = values[j] / unit - f;
+        const e = Math.abs(w - Math.round(w));
+        if (e > maxE) maxE = e;
+        sum += e;
+      }
+      out.push({ f: f, max: maxE, mean: sum / n });
+    }
+    return out;
+  }
+
+  function indicesOf(contour, simplified) {
+    const idx = [];
+    let cursor = 0;
+    for (let s = 0; s < simplified.length; s++) {
+      const p = simplified[s];
+      let found = -1;
+      for (let k = 0; k < contour.length; k++) {
+        const j = (cursor + k) % contour.length;
+        if (contour[j][0] === p[0] && contour[j][1] === p[1]) {
+          found = j;
+          break;
+        }
+      }
+      if (found < 0) return null;
+      idx.push(found);
+      cursor = found;
+    }
+    return idx;
+  }
+
+  function chainBetween(contour, i0, i1) {
+    const pts = [];
+    let i = i0;
+    for (let guard = 0; guard <= contour.length; guard++) {
+      pts.push(contour[i]);
+      if (i === i1) break;
+      i = (i + 1) % contour.length;
+    }
+    return pts;
+  }
+
+  function fitEdge(points, a, b) {
+    const ang = Math.atan2(b[1] - a[1], b[0] - a[0]);
+    const snapped = Math.round(ang / (Math.PI / 4)) * (Math.PI / 4);
+    const dx = Math.cos(snapped);
+    const dy = Math.sin(snapped);
+    const nx = -dy;
+    const ny = dx;
+    const offs = new Array(points.length);
+    for (let i = 0; i < points.length; i++) offs[i] = points[i][0] * nx + points[i][1] * ny;
+    offs.sort(function (p, q) {
+      return p - q;
+    });
+    return { nx: nx, ny: ny, c: offs[offs.length >> 1] };
+  }
+
+  function intersectLines(l1, l2) {
+    const det = l1.nx * l2.ny - l2.nx * l1.ny;
+    if (Math.abs(det) < 1e-8) return null;
+    return [(l1.c * l2.ny - l2.c * l1.ny) / det, (l1.nx * l2.c - l2.nx * l1.c) / det];
+  }
+
+  // Stairs and a one-pixel fringe pull corners off the true edge.
+  // Fit each simplified edge to the nearest 45° direction, then take intersections.
+  function refitCorners(contour, simplified, unit0) {
+    const idx = indicesOf(contour, simplified);
+    if (!idx) return simplified.map(function (p) { return p.slice(); });
+    const lines = [];
+    for (let i = 0; i < idx.length; i++) {
+      const nxt = (i + 1) % idx.length;
+      const pts = chainBetween(contour, idx[i], idx[nxt]);
+      lines.push(fitEdge(pts, simplified[i], simplified[nxt]));
+    }
+    const corners = [];
+    const limit = Math.max(unit0 * 0.55, 3);
+    for (let i = 0; i < lines.length; i++) {
+      const prev = lines[(i + lines.length - 1) % lines.length];
+      const hit = intersectLines(prev, lines[i]);
+      if (!hit || Math.hypot(hit[0] - simplified[i][0], hit[1] - simplified[i][1]) > limit) {
+        corners.push(simplified[i].slice());
+      } else {
+        corners.push(hit);
+      }
+    }
+    return corners;
+  }
+
+  function snapCandidates(rotated, unit0) {
+    const xs = new Array(rotated.length);
+    const ys = new Array(rotated.length);
+    for (let i = 0; i < rotated.length; i++) {
+      xs[i] = rotated[i][0];
+      ys[i] = rotated[i][1];
+    }
+    const found = [];
+    function pushScale(unit) {
+      const oxs = offsetCandidates(xs, unit);
+      const oys = offsetCandidates(ys, unit);
+      for (let a = 0; a < oxs.length; a++) {
+        for (let b = 0; b < oys.length; b++) {
+          const ox = oxs[a];
+          const oy = oys[b];
+          const maxErr = Math.max(ox.max, oy.max);
+          const meanErr = (ox.mean + oy.mean) / 2;
+          const rounded = new Array(rotated.length);
+          for (let i = 0; i < rotated.length; i++) {
+            rounded[i] = [Math.round(rotated[i][0] / unit - ox.f), Math.round(rotated[i][1] / unit - oy.f)];
+          }
+          found.push({
+            unit: unit,
+            fx: ox.f,
+            fy: oy.f,
+            maxErr: maxErr,
+            meanErr: meanErr,
+            rounded: rounded,
+          });
+        }
+      }
+    }
+    for (let s = 0.8; s <= 1.22 + 1e-9; s += 0.008) pushScale(unit0 * s);
+    found.sort(function (a, b) {
+      return a.maxErr - b.maxErr || a.meanErr - b.meanErr;
+    });
+    const seeds = [];
+    for (let i = 0; i < found.length && seeds.length < 3; i++) {
+      if (seeds.every(function (u) { return Math.abs(u - found[i].unit) / unit0 > 0.02; })) seeds.push(found[i].unit);
+    }
+    for (let i = 0; i < seeds.length; i++) {
+      for (let d = -0.012; d <= 0.012 + 1e-9; d += 0.002) pushScale(seeds[i] + unit0 * d);
+    }
+    return found;
+  }
+
+  function pointInPolyFloat(x, y, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i][0];
+      const yi = poly[i][1];
+      const xj = poly[j][0];
+      const yj = poly[j][1];
+      const cross = (xj - xi) * (y - yi) - (yj - yi) * (x - xi);
+      if (Math.abs(cross) < 1e-8) {
+        const dot = (x - xi) * (x - xj) + (y - yi) * (y - yj);
+        if (dot <= 1e-6) return true;
+      }
+      if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+
+  function worldFromRounded(rounded) {
+    let minX = Infinity;
+    let minY = Infinity;
+    const upright = new Array(rounded.length);
+    for (let i = 0; i < rounded.length; i++) {
+      const x = rounded[i][0];
+      const y = -rounded[i][1];
+      upright[i] = [x, y];
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+    }
+    const shifted = new Array(upright.length);
+    for (let i = 0; i < upright.length; i++) shifted[i] = [upright[i][0] - minX, upright[i][1] - minY];
+    return { minX: minX, minY: minY, points: Tangram.cleanPoints(shifted) };
+  }
+
+  function maskAgreement(mask, w, h, bounds, project, poly) {
+    let x0 = bounds.minX;
+    let y0 = bounds.minY;
+    let x1 = bounds.maxX;
+    let y1 = bounds.maxY;
+    let inter = 0;
+    let maskCount = 0;
+    let polyCount = 0;
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const on = mask[y * w + x] === 1;
+        const world = project(x + 0.5, y + 0.5);
+        const inside = pointInPolyFloat(world[0], world[1], poly);
+        if (on) maskCount++;
+        if (inside) polyCount++;
+        if (on && inside) inter++;
+      }
+    }
+    const union = maskCount + polyCount - inter;
+    return union === 0 ? 0 : inter / union;
   }
 
   function fail(code, message) {
@@ -336,87 +650,137 @@ var Tangram = globalThis.Tangram || (globalThis.Tangram = {});
     if (!contour || contour.length < 4) {
       return fail("contour", "没能沿着剪影走出外轮廓。");
     }
-    const diag = Math.hypot(w, h);
-    let simple = dropCollinear(contour);
-    let tol = Math.max(1.15, diag * 0.004);
-    let simp = simplifyClosed(simple, tol);
-    while (simp.length > 64 && tol < diag * 0.04) {
-      tol *= 1.35;
-      simp = simplifyClosed(simple, tol);
-    }
-    if (simp.length < 3) return fail("contour", "没能把剪影收成一个多边形。");
-    const areaPx = shoelace(simp);
-    if (areaPx < 80) return fail("small", "图形太小，看不清轮廓。请换一张更大的剪影。");
-    const theta = alignAngle(simp);
+    // Pixel count estimates the tangram unit. A screenshot is rarely an integer
+    // number of those units across, and anti-aliased stairs are not real corners.
+    const unit0 = Math.sqrt(comps[0].length / Tangram.TARGET_AREA);
+    if (unit0 < 6) return fail("small", "图形太小，吸附到网格后会失真。请换一张更大的剪影。");
+    const simple = dropCollinear(contour);
+    const tol = Math.min(Math.max(unit0 * 0.16, 1.8), unit0 * 0.3);
+    const simp = simplifyClosed(simple, tol);
+    if (!simp || simp.length < 3) return fail("contour", "没能把剪影收成一个多边形。");
     let cx = 0;
     let cy = 0;
+    let minPX = w;
+    let minPY = h;
+    let maxPX = 0;
+    let maxPY = 0;
     for (let i = 0; i < comps[0].length; i++) {
       const p = comps[0][i];
-      cx += p % w;
-      cy += (p / w) | 0;
+      const x = p % w;
+      const y = (p / w) | 0;
+      cx += x;
+      cy += y;
+      if (x < minPX) minPX = x;
+      if (y < minPY) minPY = y;
+      if (x > maxPX) maxPX = x;
+      if (y > maxPY) maxPY = y;
     }
     cx /= comps[0].length;
     cy /= comps[0].length;
-    const co = Math.cos(-theta);
-    const si = Math.sin(-theta);
-    const rotated = simp.map(function (p) {
-      const x = p[0] - cx;
-      const y = p[1] - cy;
-      return [cx + x * co - y * si, cy + x * si + y * co];
-    });
-    const unit = Math.sqrt(areaPx / Tangram.TARGET_AREA);
-    if (unit < 8) return fail("small", "图形太小，吸附到网格后会失真。请换一张更大的剪影。");
-    const fx = bestFrac(
-      rotated.map(function (p) {
-        return p[0];
-      }),
-      unit
-    );
-    const fy = bestFrac(
-      rotated.map(function (p) {
-        return p[1];
-      }),
-      unit
-    );
-    let maxErr = 0;
-    let sumErr = 0;
-    const rounded = rotated.map(function (p) {
-      const x = p[0] / unit - fx;
-      const y = p[1] / unit - fy;
-      const rx = Math.round(x);
-      const ry = Math.round(y);
-      maxErr = Math.max(maxErr, Math.abs(x - rx), Math.abs(y - ry));
-      sumErr += Math.abs(x - rx) + Math.abs(y - ry);
-      return [rx, ry];
-    });
-    const meanErr = sumErr / (rounded.length * 2);
-    if (meanErr > 0.18 || maxErr > 0.42) {
+    const bulge = contourBulge(contour, simp);
+    // A circle's best 45° fit is an octagon whose chords still bow out.
+    // Real tangram edges stay within a pixel of a straight line.
+    if ((bulge.mean > unit0 * 0.085 && bulge.mean > 1.35) || roundLikeACircle(simp, bulge.mean)) {
       return fail(
         "snap",
         "这张剪影的边角对不齐标准网格，程序没有把它改成另一张图。请换一块本来就能用七巧板拼成的轮廓，或在网格上点顶点。"
       );
     }
-    // Pixel y grows downward. World y grows upward, so the picture keeps the same upright pose.
-    const upright = rounded.map(function (p) {
-      return [p[0], -p[1]];
-    });
-    let minX = Infinity;
-    let minY = Infinity;
-    for (let i = 0; i < upright.length; i++) {
-      minX = Math.min(minX, upright[i][0]);
-      minY = Math.min(minY, upright[i][1]);
+    const thetas = alignmentOptions(simp);
+    const SNAP_MAX = 0.36;
+    const IOU_MIN = 0.74;
+    const viable = [];
+    for (let t = 0; t < thetas.length; t++) {
+      const theta = thetas[t];
+      const co = Math.cos(-theta);
+      const si = Math.sin(-theta);
+      const rotatedSimp = rotateAround(simp, cx, cy, co, si);
+      if (edgeAngleError(rotatedSimp) > 0.14) continue;
+      const rotatedContour = rotateAround(contour, cx, cy, co, si);
+      const corners = refitCorners(rotatedContour, rotatedSimp, unit0);
+      if (corners.length < 3) continue;
+      const raw = snapCandidates(corners, unit0);
+      raw.sort(function (a, b) {
+        return a.maxErr - b.maxErr || a.meanErr - b.meanErr;
+      });
+      const seen = new Set();
+      let kept = 0;
+      for (let i = 0; i < raw.length && kept < 6; i++) {
+        const cand = raw[i];
+        if (cand.maxErr > SNAP_MAX) break;
+        const world = worldFromRounded(cand.rounded);
+        if (!world.points || world.points.length < 3) continue;
+        const key = world.points
+          .map(function (p) {
+            return p[0] + "," + p[1];
+          })
+          .join(";");
+        if (seen.has(key)) continue;
+        seen.add(key);
+        kept++;
+        const pad = Math.ceil(unit0) + 2;
+        const bounds = {
+          minX: Math.max(0, minPX - pad),
+          minY: Math.max(0, minPY - pad),
+          maxX: Math.min(w - 1, maxPX + pad),
+          maxY: Math.min(h - 1, maxPY + pad),
+        };
+        const project = function (x, y) {
+          const dx = x - cx;
+          const dy = y - cy;
+          const rx = cx + dx * co - dy * si;
+          const ry = cy + dx * si + dy * co;
+          const gx = rx / cand.unit - cand.fx;
+          const gy = ry / cand.unit - cand.fy;
+          return [gx - world.minX, -gy - world.minY];
+        };
+        const iou = maskAgreement(mask, w, h, bounds, project, world.points);
+        if (iou < IOU_MIN) continue;
+        viable.push({
+          maxErr: cand.maxErr,
+          meanErr: cand.meanErr,
+          unit: cand.unit,
+          iou: iou,
+          points: world.points,
+          analysis: Tangram.analyze(world.points),
+        });
+      }
     }
-    const shifted = upright.map(function (p) {
-      return [p[0] - minX, p[1] - minY];
+    if (!viable.length) {
+      return fail(
+        "snap",
+        "这张剪影的边角对不齐标准网格，程序没有把它改成另一张图。请换一块本来就能用七巧板拼成的轮廓，或在网格上点顶点。"
+      );
+    }
+    viable.sort(function (a, b) {
+      return a.maxErr - b.maxErr;
     });
-    const cleaned = Tangram.cleanPoints(shifted);
-    if (cleaned.length < 3) return fail("contour", "吸附之后没有剩下一块完整图形。");
+    const errCut = viable[0].maxErr + 0.08;
+    const pool = [];
+    for (let i = 0; i < viable.length; i++) if (viable[i].maxErr <= errCut) pool.push(viable[i]);
+    function gridRank(code) {
+      if (code === "ok") return 0;
+      if (code === "area" || code === "hole" || code === "disconnect") return 1;
+      return 3;
+    }
+    pool.sort(function (a, b) {
+      const ag = gridRank(a.analysis.code);
+      const bg = gridRank(b.analysis.code);
+      if (ag !== bg) return ag - bg;
+      if (Math.abs(a.maxErr - b.maxErr) > 0.02) return a.maxErr - b.maxErr;
+      return b.iou - a.iou;
+    });
+    const chosen = pool[0];
+    const scaleOff = Math.abs(chosen.unit - unit0) / unit0;
+    const fitted = scaleOff > 0.03 || chosen.maxErr > 0.08;
     return {
       ok: true,
       code: "ok",
-      message: "已把剪影的边角吸附到 45° 网格。",
-      points: cleaned,
-      snapError: meanErr,
+      message: fitted
+        ? "已按这张图的实际尺寸，把边角吸附到 45° 网格。"
+        : "已把剪影的边角吸附到 45° 网格。",
+      points: chosen.points,
+      snapError: chosen.maxErr,
     };
   }
 

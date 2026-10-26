@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import vm from "vm";
+import zlib from "zlib";
 import { fileURLToPath } from "url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -62,6 +63,72 @@ function inside(x, y, poly) {
     if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) c = !c;
   }
   return c;
+}
+
+function decodePng(buf) {
+  const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+  let p = 8;
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  const idat = [];
+  while (p < input.length) {
+    const len = input.readUInt32BE(p);
+    p += 4;
+    const type = input.toString("ascii", p, p + 4);
+    p += 4;
+    const data = input.subarray(p, p + len);
+    p += len + 4;
+    if (type === "IHDR") {
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      bitDepth = data[8];
+      colorType = data[9];
+    } else if (type === "IDAT") idat.push(data);
+    else if (type === "IEND") break;
+  }
+  if (bitDepth !== 8 || (colorType !== 6 && colorType !== 2)) throw new Error("unsupported png");
+  const bpp = colorType === 6 ? 4 : 3;
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const stride = width * bpp;
+  const out = new Uint8Array(width * height * 4);
+  const prev = Buffer.alloc(stride);
+  const row = Buffer.alloc(stride);
+  let src = 0;
+  function paeth(a, b, c) {
+    const pred = a + b - c;
+    const pa = Math.abs(pred - a);
+    const pb = Math.abs(pred - b);
+    const pc = Math.abs(pred - c);
+    if (pa <= pb && pa <= pc) return a;
+    if (pb <= pc) return b;
+    return c;
+  }
+  for (let y = 0; y < height; y++) {
+    const filter = raw[src++];
+    for (let i = 0; i < stride; i++) row[i] = raw[src++];
+    for (let i = 0; i < stride; i++) {
+      const left = i >= bpp ? row[i - bpp] : 0;
+      const up = prev[i];
+      const ul = i >= bpp ? prev[i - bpp] : 0;
+      if (filter === 1) row[i] = (row[i] + left) & 255;
+      else if (filter === 2) row[i] = (row[i] + up) & 255;
+      else if (filter === 3) row[i] = (row[i] + ((left + up) >> 1)) & 255;
+      else if (filter === 4) row[i] = (row[i] + paeth(left, up, ul)) & 255;
+      else if (filter !== 0) throw new Error("png filter " + filter);
+    }
+    row.copy(prev);
+    for (let x = 0; x < width; x++) {
+      const s = x * bpp;
+      const o = (y * width + x) * 4;
+      out[o] = row[s];
+      out[o + 1] = bpp > 1 ? row[s + 1] : row[s];
+      out[o + 2] = bpp > 2 ? row[s + 2] : row[s];
+      out[o + 3] = bpp === 4 ? row[s + 3] : 255;
+    }
+  }
+  return { width, height, data: out };
 }
 
 function normSig(points) {
@@ -177,7 +244,64 @@ assert(thinSol.status === "none", "thin unsolved " + thinSol.status + " " + thin
   }
   const ex = T.extractSilhouette(data, w, h);
   console.log("circle", ex.ok, ex.code, ex.message);
-  assert(!ex.ok, "circle rejected");
+  assert(!ex.ok && ex.code === "snap", "circle rejected");
+}
+
+// Same diamond, turned the other way. Alignment must not spin it by 45°.
+{
+  const w = 220, h = 220;
+  const data = blank(w, h, [20, 20, 20]);
+  const unit = 28;
+  const cx = 110, cy = 110;
+  const ang = (-12 * Math.PI) / 180;
+  const base = [[2, 0], [4, 2], [2, 4], [0, 2]];
+  const poly = base.map((p) => {
+    const x = (p[0] - 2) * unit;
+    const y = (p[1] - 2) * unit;
+    const co = Math.cos(ang), si = Math.sin(ang);
+    return [cx + x * co - y * si, cy + x * si + y * co];
+  });
+  fillPoly(data, w, h, poly, [245, 245, 245]);
+  const ex = T.extractSilhouette(data, w, h);
+  console.log("diamond -12", ex.ok, ex.code, ex.points, "err", ex.snapError);
+  assert(ex.ok, "negative diamond extract " + (ex.message || ""));
+  assert(normSig(ex.points) === normSig(base), "negative diamond shape");
+}
+
+// House drawn at a scale that is not an integer number of pixels per unit.
+{
+  const w = 280, h = 260;
+  const data = blank(w, h, [250, 250, 248]);
+  const unit = 19.4;
+  const ang = (-8 * Math.PI) / 180;
+  const house = T.FIGURES.find((f) => f.id === "house").points;
+  const cx = 140, cy = 130;
+  const poly = house.map((p) => {
+    const x = (p[0] - 2) * unit;
+    const y = (p[1] - 1.5) * unit;
+    const co = Math.cos(ang), si = Math.sin(ang);
+    const rx = x * co - y * si;
+    const ry = x * si + y * co;
+    return [cx + rx, cy - ry];
+  });
+  fillPoly(data, w, h, poly, [10, 10, 10]);
+  const ex = T.extractSilhouette(data, w, h);
+  console.log("odd house", ex.ok, ex.code, ex.points, ex.snapError);
+  assert(ex.ok, "odd-scale house " + (ex.message || ""));
+  assert(normSig(ex.points) === normSig(house), "odd-scale house shape");
+}
+
+// Screenshot of a finished tree: pixel size is not a clean multiple of the unit,
+// and the fringe is anti-aliased.
+{
+  const png = decodePng(fs.readFileSync(path.join(root, "test/fixtures/tree-silhouette.png")));
+  const ex = T.extractSilhouette(png.data, png.width, png.height);
+  console.log("tree", ex.ok, ex.code, ex.message, ex.points, ex.snapError);
+  assert(ex.ok, "tree extract " + (ex.message || ""));
+  const tree = [[2, 4], [0, 2], [1, 2], [0, 1], [1, 1], [1, 0], [2, 0], [2, 1], [4, 1], [3, 2], [4, 2]];
+  assert(normSig(ex.points) === normSig(tree), "tree snaps onto the lattice outline");
+  const solved = T.solveSync(T.analyze(ex.points).quarters);
+  assert(solved.status === "solved", "tree solves " + solved.status + " " + (solved.reason || ""));
 }
 
 // two blobs
