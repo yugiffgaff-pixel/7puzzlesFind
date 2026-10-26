@@ -1,0 +1,7 @@
+{
+  "name": "7puzzles-find",
+  "private": true,
+  "scripts": {
+    "test": "node test/solver.test.js && node test/completeness.js && node test/image.test.js"
+  }
+}
