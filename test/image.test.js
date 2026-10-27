@@ -7,7 +7,7 @@ import { fileURLToPath } from "url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const context = { console, performance: { now: () => Date.now() }, Uint8Array, Int16Array };
 vm.createContext(context);
-for (const file of ["js/grid.js", "js/pieces.js", "js/solver.js", "js/analyze.js", "js/image.js", "js/figures.js"]) {
+for (const file of ["js/grid.js", "js/pieces.js", "js/solver.js", "js/analyze.js", "js/geom.js", "js/image.js", "js/figures.js"]) {
   vm.runInContext(fs.readFileSync(path.join(root, file), "utf8"), context, { filename: file });
 }
 const T = context.Tangram;
@@ -298,10 +298,28 @@ assert(thinSol.status === "none", "thin unsolved " + thinSol.status + " " + thin
   const ex = T.extractSilhouette(png.data, png.width, png.height);
   console.log("tree", ex.ok, ex.code, ex.message, ex.points, ex.snapError);
   assert(ex.ok, "tree extract " + (ex.message || ""));
-  const tree = [[2, 4], [0, 2], [1, 2], [0, 1], [1, 1], [1, 0], [2, 0], [2, 1], [4, 1], [3, 2], [4, 2]];
-  assert(normSig(ex.points) === normSig(tree), "tree snaps onto the lattice outline");
-  const solved = T.solveSync(T.analyze(ex.points).quarters);
-  assert(solved.status === "solved", "tree solves " + solved.status + " " + (solved.reason || ""));
+  assert(ex.exact, "tree keeps an off-grid outline");
+  const tree = [
+    [4, 2], [3, 2], [4, 1], [2.5, 1], [2.5, 0], [1.5, 0], [1.5, 1], [0, 1], [1, 2], [0, 2], [2, 4],
+  ];
+  function sig(points) {
+    const pts = points.map((p) => [Math.round(p[0] * 1000) / 1000, Math.round(p[1] * 1000) / 1000]);
+    let start = 0;
+    for (let i = 1; i < pts.length; i++) {
+      if (pts[i][0] < pts[start][0] - 1e-9 || (Math.abs(pts[i][0] - pts[start][0]) < 1e-9 && pts[i][1] < pts[start][1])) start = i;
+    }
+    const ordered = [];
+    for (let i = 0; i < pts.length; i++) ordered.push(pts[(start + i) % pts.length]);
+    return ordered.map((p) => p[0] + "," + p[1]).join(";");
+  }
+  assert(sig(ex.points) === sig(tree), "tree keeps the centered trunk\n got " + sig(ex.points) + "\n exp " + sig(tree));
+  const solved = T.solveGeom(ex.exact, 20000);
+  assert(solved.status === "solved" && solved.solution.length === 7, "tree solves " + solved.status);
+  const apex = ex.points.reduce((a, p) => (p[1] > a[1] ? p : a));
+  const trunk = solved.solution.find((piece) => piece.type === "square");
+  const txs = trunk.outer.map((p) => p[0]);
+  const mid = (Math.min.apply(null, txs) + Math.max.apply(null, txs)) / 2;
+  assert(Math.abs(mid - apex[0]) < 1e-6, "trunk center " + mid + " lines up with the apex " + apex[0]);
 }
 
 // two blobs

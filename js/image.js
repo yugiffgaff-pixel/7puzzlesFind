@@ -585,6 +585,31 @@ var Tangram = globalThis.Tangram || (globalThis.Tangram = {});
     return inside;
   }
 
+  function moduleFit(corners) {
+    const fit = Tangram.fitModulePolygon(corners);
+    if (!fit) return null;
+    const flipped = fit.pts.map(function (p) {
+      return Tangram.exactPoint(p.x, Tangram.nNeg(p.y));
+    });
+    let minX = Infinity;
+    let minY = Infinity;
+    for (let i = 0; i < flipped.length; i++) {
+      const x = Tangram.nNum(flipped[i].x);
+      const y = Tangram.nNum(flipped[i].y);
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+    }
+    const exact = Tangram.shiftMinExact(flipped);
+    return {
+      maxErr: fit.maxErr,
+      unit: fit.unit,
+      points: exact.map(function (p) { return Tangram.pNum(p); }),
+      exact: exact,
+      minX: minX,
+      minY: minY,
+    };
+  }
+
   function worldFromRounded(rounded) {
     let minX = Infinity;
     let minY = Infinity;
@@ -690,6 +715,14 @@ var Tangram = globalThis.Tangram || (globalThis.Tangram = {});
     const SNAP_MAX = 0.36;
     const IOU_MIN = 0.74;
     const viable = [];
+    let bestModule = null;
+    const pad = Math.ceil(unit0) + 2;
+    const bounds = {
+      minX: Math.max(0, minPX - pad),
+      minY: Math.max(0, minPY - pad),
+      maxX: Math.min(w - 1, maxPX + pad),
+      maxY: Math.min(h - 1, maxPY + pad),
+    };
     for (let t = 0; t < thetas.length; t++) {
       const theta = thetas[t];
       const co = Math.cos(-theta);
@@ -699,6 +732,27 @@ var Tangram = globalThis.Tangram || (globalThis.Tangram = {});
       const rotatedContour = rotateAround(contour, cx, cy, co, si);
       const corners = refitCorners(rotatedContour, rotatedSimp, unit0);
       if (corners.length < 3) continue;
+      const fitted = moduleFit(corners);
+      if (fitted && fitted.maxErr <= 0.12) {
+        const project = function (x, y) {
+          const dx = x - cx;
+          const dy = y - cy;
+          const rx = cx + dx * co - dy * si;
+          const ry = cy + dx * si + dy * co;
+          const gx = (rx - corners[0][0]) / fitted.unit;
+          const gy = (ry - corners[0][1]) / fitted.unit;
+          return [gx - fitted.minX, -gy - fitted.minY];
+        };
+        const iou = maskAgreement(mask, w, h, bounds, project, fitted.points);
+        if (iou >= 0.88 && (!bestModule || fitted.maxErr < bestModule.maxErr - 1e-9 || (Math.abs(fitted.maxErr - bestModule.maxErr) <= 1e-9 && iou > bestModule.iou))) {
+          bestModule = {
+            maxErr: fitted.maxErr,
+            iou: iou,
+            points: fitted.points,
+            exact: fitted.exact,
+          };
+        }
+      }
       const raw = snapCandidates(corners, unit0);
       raw.sort(function (a, b) {
         return a.maxErr - b.maxErr || a.meanErr - b.meanErr;
@@ -718,13 +772,6 @@ var Tangram = globalThis.Tangram || (globalThis.Tangram = {});
         if (seen.has(key)) continue;
         seen.add(key);
         kept++;
-        const pad = Math.ceil(unit0) + 2;
-        const bounds = {
-          minX: Math.max(0, minPX - pad),
-          minY: Math.max(0, minPY - pad),
-          maxX: Math.min(w - 1, maxPX + pad),
-          maxY: Math.min(h - 1, maxPY + pad),
-        };
         const project = function (x, y) {
           const dx = x - cx;
           const dy = y - cy;
@@ -745,6 +792,21 @@ var Tangram = globalThis.Tangram || (globalThis.Tangram = {});
           analysis: Tangram.analyze(world.points),
         });
       }
+    }
+    const bestLatticeErr = viable.length ? viable.reduce(function (m, item) { return Math.min(m, item.maxErr); }, Infinity) : Infinity;
+    if (bestModule && (!viable.length || bestModule.maxErr + 0.04 < bestLatticeErr)) {
+      const onLattice = Tangram.analyze(bestModule.points).ok;
+      const scaleNote = bestModule.maxErr > 0.08;
+      return {
+        ok: true,
+        code: "ok",
+        message: onLattice
+          ? (scaleNote ? "已按这张图的实际尺寸，把边角吸附到 45° 网格。" : "已把剪影的边角吸附到 45° 网格。")
+          : "已按这张图的实际尺寸，把边角收到 45° 方向上。拼块可以离开整格交点。",
+        points: bestModule.points,
+        exact: onLattice ? null : bestModule.exact,
+        snapError: bestModule.maxErr,
+      };
     }
     if (!viable.length) {
       return fail(
