@@ -32,6 +32,7 @@
     figureId: "square",
     suggestion: null,
     backup: null,
+    exact: null,
   };
 
   let view = { scale: 40, ox: 0, oy: 0 };
@@ -207,11 +208,20 @@
   }
 
   function poseText(step) {
-    if (step.type === "square") return "四边一样，转 90° 看起来相同。";
-    let turn = "按图例的初始方向";
-    if (step.rot === 1) turn = "相对图例，逆时针转 90°";
-    else if (step.rot === 2) turn = "相对图例，转 180°";
-    else if (step.rot === 3) turn = "相对图例，顺时针转 90°";
+    if (step.type === "square" && (step.rot45 == null || step.rot45 % 2 === 0)) return "四边一样，转 90° 看起来相同。";
+    if (step.type === "square") return "转 45°，看起来是菱形。";
+    const deg = step.rot45 != null ? step.rot45 * 45 : step.rot * 90;
+    const turns = {
+      0: "按图例的初始方向",
+      45: "相对图例，逆时针转 45°",
+      90: "相对图例，逆时针转 90°",
+      135: "相对图例，逆时针转 135°",
+      180: "相对图例，转 180°",
+      225: "相对图例，顺时针转 135°",
+      270: "相对图例，顺时针转 90°",
+      315: "相对图例，顺时针转 45°",
+    };
+    let turn = turns[deg] || "按图例的初始方向";
     if (step.type === "para") turn += step.flip ? "，要翻面" : "，不用翻面";
     return turn + "。";
   }
@@ -236,7 +246,7 @@
     } else if (state.mode === "draw") {
       hint.textContent = "点格点围出图形。例如正方形可以点 (2,0)、(4,2)、(2,4)、(0,2)。面积不是 8，或边不沿网格，会直接说明原因。";
     } else {
-      hint.textContent = "上传一块实心剪影。程序提取外轮廓，并把边角吸附到 45° 网格。照片和曲线图形会告诉你对不齐，而不会硬切。";
+      hint.textContent = "上传一块实心剪影。边沿 45° 时，七块可以离开整格交点。照片和弯曲的轮廓仍会告诉你对不齐，不会硬切。";
     }
   }
 
@@ -332,6 +342,7 @@
         state.figureId = null;
         state.suggestion = null;
         state.backup = null;
+        state.exact = null;
         state.note = "";
         solveCurrent();
       });
@@ -446,6 +457,7 @@
       state.closed = false;
       state.steps = null;
       state.analysis = null;
+      state.exact = null;
       state.status = "在格点上围一块图形，再求解。";
       state.progress = "";
     }
@@ -455,6 +467,7 @@
       state.closed = false;
       state.steps = null;
       state.analysis = null;
+      state.exact = null;
       state.status = "选择一张只有一块实心剪影的图片。";
       state.progress = "";
     }
@@ -483,6 +496,7 @@
     state.suggestion = null;
     state.backup = null;
     state.note = "";
+    state.exact = null;
     state.points = fig.points.map(function (p) {
       return p.slice();
     });
@@ -514,6 +528,7 @@
     state.analysis = null;
     state.suggestion = null;
     state.note = "";
+    state.exact = null;
     state.status = state.points.length ? "已撤销最后一个顶点。" : "在格点上围一块图形，再求解。";
     state.progress = "";
     renderMeter();
@@ -531,6 +546,7 @@
     state.suggestion = null;
     state.backup = null;
     state.note = "";
+    state.exact = null;
     state.progress = "";
     state.status = "在格点上围一块图形，再求解。";
     renderMeter();
@@ -549,6 +565,10 @@
     renderMeter();
     resize();
     if (!analysis.ok) {
+      if (state.exact) {
+        await solveExact(token);
+        return;
+      }
       state.status = analysis.message;
       renderPanel();
       return;
@@ -582,6 +602,36 @@
     resize();
   }
 
+  async function solveExact(token) {
+    state.status = "正在搜索七块的摆法…";
+    renderPanel();
+    const search = Tangram.startGeom(state.exact, 20000);
+    while (search.status === "running") {
+      if (token !== state.token) return;
+      Tangram.stepGeom(search, 12);
+      if (search.status === "running") {
+        state.progress = "已搜索 " + search.nodes + " 步";
+        renderPanel();
+        await new Promise(function (resolve) {
+          setTimeout(resolve, 16);
+        });
+      }
+    }
+    if (token !== state.token) return;
+    state.progress = "";
+    if (search.status === "solved") {
+      state.steps = Tangram.presentGeom(search.solution);
+      state.step = state.steps.length;
+      state.status = "可以拼成。分割线就是这七块相接的边。下面从较低的一块开始，按顺序放上。相同的块对调也行，所以拼法可能不止一种。";
+    } else if (search.status === "limit") {
+      state.status = "已经搜索了 " + search.nodes + " 步，还没有找到拼法。这个轮廓用标准七块可能拼不出来。";
+    } else {
+      state.status = "搜索已经走完，这个轮廓用标准七块拼不出来：七块没法同时铺满，又不互相重叠。";
+    }
+    renderPanel();
+    resize();
+  }
+
   function showClosest() {
     if (!state.analysis || !state.analysis.quarters.length) return;
     const near = Tangram.closestFigure(state.analysis.quarters);
@@ -597,7 +647,9 @@
       mode: state.mode,
       figureId: state.figureId,
       note: state.note,
+      exact: state.exact,
     };
+    state.exact = null;
     state.suggestion = near;
     const pct = Math.round(near.iou * 100);
     const lead = near.iou < 0.35 ? "图库里没有很像的。" : "这不是你提交的那块图形。";
@@ -616,6 +668,7 @@
     state.mode = state.backup.mode;
     state.figureId = state.backup.figureId;
     state.note = "";
+    state.exact = state.backup.exact || null;
     state.suggestion = null;
     state.backup = null;
     state.closed = true;
@@ -651,6 +704,7 @@
       state.steps = null;
       state.analysis = null;
       state.note = "";
+      state.exact = null;
     }
     if (state.points.length >= 3) {
       const a = state.points[0];
@@ -694,6 +748,7 @@
         state.closed = false;
         state.steps = null;
         state.analysis = null;
+        state.exact = null;
         state.progress = "";
         state.status = extracted.message;
         renderMeter();
@@ -702,6 +757,7 @@
         return;
       }
       state.points = extracted.points;
+      state.exact = extracted.exact || null;
       state.closed = true;
       state.note = extracted.message;
       solveCurrent();

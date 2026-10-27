@@ -113,6 +113,10 @@ main {
   margin: 12px 0;
 }
 
+.figure-bar[hidden] {
+  display: none;
+}
+
 .figure-bar button, .toolbar button, .step-actions button, .ghost {
   border: 1px solid var(--line);
   background: white;
