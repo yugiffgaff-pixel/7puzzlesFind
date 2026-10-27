@@ -652,6 +652,29 @@ var Tangram = globalThis.Tangram || (globalThis.Tangram = {});
     return { ok: false, code: code, message: message, points: [] };
   }
 
+  // Shortest edge, in units of sqrt(area/8). A one-pixel flat on a sharp tip
+  // is not a side; anything still under 1 cannot be a standard tangram edge.
+  function shortestRealEdge(points) {
+    let area = 0;
+    const lengths = [];
+    for (let i = 0; i < points.length; i++) {
+      const a = points[i];
+      const b = points[(i + 1) % points.length];
+      area += a[0] * b[1] - b[0] * a[1];
+      lengths.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
+    }
+    area = Math.abs(area) / 2;
+    if (area < 1e-6 || !lengths.length) return 1;
+    const unit = Math.sqrt(area / Tangram.TARGET_AREA);
+    let minL = Infinity;
+    for (let i = 0; i < lengths.length; i++) {
+      if (lengths[i] < unit * 0.22) continue;
+      if (lengths[i] < minL) minL = lengths[i];
+    }
+    if (minL === Infinity) minL = Math.min.apply(null, lengths);
+    return minL / unit;
+  }
+
   function extractSilhouette(rgba, w, h) {
     if (!rgba || w < 12 || h < 12) {
       return fail("small", "图片太小，看不清轮廓。请换一张更大的剪影。");
@@ -716,6 +739,8 @@ var Tangram = globalThis.Tangram || (globalThis.Tangram = {});
     const IOU_MIN = 0.74;
     const viable = [];
     let bestModule = null;
+    let sawAligned = false;
+    let shortest = Infinity;
     const pad = Math.ceil(unit0) + 2;
     const bounds = {
       minX: Math.max(0, minPX - pad),
@@ -728,10 +753,14 @@ var Tangram = globalThis.Tangram || (globalThis.Tangram = {});
       const co = Math.cos(-theta);
       const si = Math.sin(-theta);
       const rotatedSimp = rotateAround(simp, cx, cy, co, si);
-      if (edgeAngleError(rotatedSimp) > 0.14) continue;
+      const angErr = edgeAngleError(rotatedSimp);
+      if (angErr > 0.14) continue;
       const rotatedContour = rotateAround(contour, cx, cy, co, si);
       const corners = refitCorners(rotatedContour, rotatedSimp, unit0);
       if (corners.length < 3) continue;
+      sawAligned = true;
+      const ratio = shortestRealEdge(corners);
+      if (ratio < shortest) shortest = ratio;
       const fitted = moduleFit(corners);
       if (fitted && fitted.maxErr <= 0.12) {
         const project = function (x, y) {
@@ -809,6 +838,14 @@ var Tangram = globalThis.Tangram || (globalThis.Tangram = {});
       };
     }
     if (!viable.length) {
+      if (sawAligned) {
+        return fail(
+          "shape",
+          shortest < 0.75
+            ? "这张剪影的边已经沿水平、垂直或 45°，但有一条边比最小的那块三角还短，标准七块拼不出这种长短。程序没有把它改成另一张图。"
+            : "这张剪影的边已经沿水平、垂直或 45°，但这些长短对不上标准的七块，拼不出来。程序没有把它改成另一张图。"
+        );
+      }
       return fail(
         "snap",
         "这张剪影的边角对不齐标准网格，程序没有把它改成另一张图。请换一块本来就能用七巧板拼成的轮廓，或在网格上点顶点。"

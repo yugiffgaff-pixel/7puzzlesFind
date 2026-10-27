@@ -322,6 +322,28 @@ assert(thinSol.status === "none", "thin unsolved " + thinSol.status + " " + thin
   assert(Math.abs(mid - apex[0]) < 1e-6, "trunk center " + mid + " lines up with the apex " + apex[0]);
 }
 
+// Shirt silhouette from the same batch: a lattice tangram, still solves.
+{
+  const png = decodePng(fs.readFileSync(path.join(root, "test/fixtures/shirt-silhouette.png")));
+  const ex = T.extractSilhouette(png.data, png.width, png.height);
+  console.log("shirt", ex.ok, ex.code, ex.message, ex.points, ex.snapError);
+  assert(ex.ok && !ex.exact, "shirt stays on the integer grid");
+  const solved = T.solveSync(T.analyze(ex.points).quarters);
+  assert(solved.status === "solved" && solved.solution.length === 7, "shirt solves " + solved.status);
+}
+
+// Hen silhouette: edges are already on the 45° family, but the beak is shorter
+// than the smallest piece. Do not report that as a grid-alignment failure,
+// and do not replace it with a different figure.
+{
+  const png = decodePng(fs.readFileSync(path.join(root, "test/fixtures/hen-silhouette.png")));
+  const ex = T.extractSilhouette(png.data, png.width, png.height);
+  console.log("hen", ex.ok, ex.code, ex.message);
+  assert(!ex.ok && ex.code === "shape", "hen is a 45° outline that is not a tangram");
+  assert(ex.message.indexOf("比最小的那块三角还短") >= 0, "hen explains the short edge");
+  assert(ex.message.indexOf("对不齐标准网格") < 0, "hen is not blamed on the grid");
+}
+
 // two blobs
 {
   const w = 120, h = 80;
